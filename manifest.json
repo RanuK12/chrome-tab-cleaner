@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Ranukita Tab Cleaner",
+  "version": "1.0",
+  "description": "Automatically cleans inactive tabs to save RAM.",
+  "permissions": ["tabs", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Ranukita Tab Cleaner"
+  }
+}
