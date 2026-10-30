@@ -1,13 +1,41 @@
 {
   "manifest_version": 3,
-  "name": "Ranukita Tab Cleaner",
-  "version": "1.0",
-  "description": "Automatically cleans inactive tabs to save RAM.",
-  "permissions": ["tabs", "storage"],
+  "name": "Ranukita Bridge",
+  "version": "0.3.0",
+  "version_name": "0.3.0-ultra (depuración profunda + Zero Focus Theft)",
+  "description": "Conecta tu Chrome real con Ranukita para automatización en background, depuración profunda (consola CDP, red, logs) y Zero Focus Theft.",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "storage",
+    "debugger",
+    "cookies",
+    "alarms",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>",
+    "http://*/*",
+    "https://*/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["ranukita-stealth.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ],
   "action": {
-    "default_title": "Ranukita Tab Cleaner"
+    "default_title": "Ranukita Bridge",
+    "default_popup": "popup.html"
+  },
+  "icons": {
+    "128": "icons/icon128.png"
   }
 }
