@@ -1161,20 +1161,45 @@ async function rkBaseHandleCommand(cmd) {
       }
 
       case "new_tab": {
-        const tab = await chrome.tabs.create({ url: cmd.url, active: cmd.active !== false });
-        await waitForTabComplete(tab.id, 30000);
-        TARGET_TAB = tab.id;
-        const fresh = await chrome.tabs.get(tab.id);
-        const freshUrl = (fresh.url || "").toLowerCase();
-        if (freshUrl.startsWith("chrome-error://") || freshUrl.startsWith("chrome://net-error/") || freshUrl.includes("chromewebdata")) {
-          return {
-            ok: false,
-            error: `page_load_error: No se pudo cargar '${cmd.url}'. Error de red o DNS (página de error de Chrome). Navegá a otra URL o usá web_search.`,
-            tabId: fresh.id,
-            url: fresh.url
-          };
+        let createProps = { url: cmd.url, active: cmd.active !== false };
+        if (cmd.windowId) {
+          createProps.windowId = cmd.windowId;
+        } else {
+          try {
+            const wins = await chrome.windows.getAll({ windowTypes: ['normal'] });
+            if (wins && wins.length > 0) {
+              const normalWin = wins.find(w => w.focused) || wins[0];
+              if (normalWin) createProps.windowId = normalWin.id;
+            }
+          } catch (e) {}
         }
-        return { ok: true, tabId: tab.id, url: tab.url };
+        let tab;
+        try {
+          tab = await chrome.tabs.create(createProps);
+        } catch (err) {
+          if (String(err).includes("No current window") || String(err).includes("window")) {
+            const win = await chrome.windows.create({ url: cmd.url, focused: false });
+            tab = win.tabs && win.tabs[0] ? win.tabs[0] : { id: null, url: cmd.url };
+          } else {
+            throw err;
+          }
+        }
+        if (tab && tab.id) {
+          await waitForTabComplete(tab.id, 30000);
+          TARGET_TAB = tab.id;
+          const fresh = await chrome.tabs.get(tab.id);
+          const freshUrl = (fresh.url || "").toLowerCase();
+          if (freshUrl.startsWith("chrome-error://") || freshUrl.startsWith("chrome://net-error/") || freshUrl.includes("chromewebdata")) {
+            return {
+              ok: false,
+              error: `page_load_error: No se pudo cargar '${cmd.url}'. Error de red o DNS (página de error de Chrome). Navegá a otra URL o usá web_search.`,
+              tabId: fresh.id,
+              url: fresh.url
+            };
+          }
+          return { ok: true, tabId: tab.id, url: tab.url };
+        }
+        return { ok: true, tabId: null, url: cmd.url };
       }
 
       case "close_tab": {
