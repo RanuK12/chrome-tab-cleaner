@@ -1016,6 +1016,12 @@ async function rkBaseHandleCommand(cmd) {
     switch (cmd.action) {
       // ─── existentes (compat) ───────────────────────────────────────────────
       case "ping": return { ok: true, pong: true };
+      case "get_cookies": {
+        const targetUrl = cmd.url || "https://flow.google.com";
+        const cookies = await chrome.cookies.getAll({ url: targetUrl });
+        const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+        return { ok: true, cookieString: cookieStr, cookies: cookies.map(c => ({ name: c.name, value: c.value })) };
+      }
       // Con qué cuenta de X está logueado este perfil. El server lo usa para rutear.
       case "xuser": return { ok: true, xuser: await xUserId() };
       case "reload": {
@@ -1248,7 +1254,7 @@ async function rkBaseHandleCommand(cmd) {
 
       case "eval": {
         const tabId = await resolveTabId(cmd.tabId);
-        const expr = cmd.js.trim();
+        const expr = (cmd.js || cmd.code || "").trim();
         const hasStatements = /(?:^|;\s*|\n\s*)(const|let|var|function|return|throw|try|if|for|while|switch)\s/.test(expr)
                             || expr.includes(";");
         const isAsyncExpr = /await\s/.test(expr);
