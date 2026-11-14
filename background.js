@@ -2,31 +2,83 @@
 // v2.5.0: ver README-NEW-ACTIONS.md. Compatible hacia atrás: las acciones existentes siguen igual (list_tabs solo suma campos).
 // v2.4.0: versión unificada, x_unfollow_step (clicks CDP de confianza + verificación + corte ante avisos),
 // navigate/new_tab ya no pisan la pestaña activa de Emilio ni pestañas ajenas a X.
-importScripts("x_tab_policy.js", "x_unfollow_core.js", "rk_debug.js");
-const RK_VERSION = "2.5.0";
-const RK_CAPS = ["x_unfollow_step", "tabs_info", "site_access", "tab_reload_discarded", "guard_check", "console_start", "console_stop", "console_read", "net_errors", "log_read", "log_clear", "debug_info", "captcha_guard", "reload_if_discarded"];
+importScripts("x_tab_policy.js", "rk_debug.js");
+const RK_VERSION = "0.3.0";
+const RK_CAPS = ["tabs_info", "site_access", "tab_reload_discarded", "guard_check", "console_start", "console_stop", "console_read", "net_errors", "log_read", "log_clear", "debug_info", "captcha_guard", "reload_if_discarded"];
 const WS_URL = "ws://127.0.0.1:9223/ws";
 let ws = null;
 const attachedTabs = new Map(); // tabId -> detachTimer
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function isPersonalTab(t) {
+  if (!t) return false;
+  const url = String(t.url || "").toLowerCase();
+  const title = String(t.title || "").toLowerCase();
+  if (url.includes("tanquer9@gmail.com") || title.includes("tanquer9@gmail.com")) return true;
+  if (url.includes("mail.google.com/mail/u/0") && title.includes("tanquer9")) return true;
+  if (title.includes("livfrombrighton") || url.includes("livfrombrighton")) return true;
+  return false;
+}
+
+async function getPersonalWindowIds() {
+  try {
+    const all = await chrome.tabs.query({});
+    const wins = new Set();
+    for (const t of all) {
+      if (isPersonalTab(t)) wins.add(t.windowId);
+    }
+    return wins;
+  } catch (e) {
+    return new Set();
+  }
+}
+
+async function getWorkWindowId() {
+  try {
+    const all = await chrome.tabs.query({});
+    const personalWins = await getPersonalWindowIds();
+    for (const t of all) {
+      if (!personalWins.has(t.windowId)) {
+        const u = String(t.url || "").toLowerCase();
+        if (u.includes("linkedin.com") || u.includes("laborx.com") || u.includes("sproutgigs.com") || u.includes("reddit.com") || u.includes("x.com")) {
+          return t.windowId;
+        }
+      }
+    }
+    const workTab = all.find(t => !personalWins.has(t.windowId));
+    return workTab ? workTab.windowId : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function activeTab(tabId, hint) {
   const xOnly = wantsX(hint);
+  const personalWins = await getPersonalWindowIds();
   if (tabId !== undefined && tabId !== null && tabId !== "") {
     try {
       const t = await chrome.tabs.get(Number(tabId));
+      if (personalWins.has(t.windowId) || isPersonalTab(t)) {
+        console.warn("[Ranukita Guard] Bloqueado acceso a pestaña personal:", t.id, t.url);
+        return null;
+      }
       if (!xOnly || isXUrl(t.url)) return t;
     } catch (e) {}
   }
+  const all = (await chrome.tabs.query({})).filter(t => !personalWins.has(t.windowId) && !isPersonalTab(t));
   if (xOnly) {
-    const all = await chrome.tabs.query({});
     return all.find((t) => isXUrl(t.url)) || null;
   }
-  const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  if (t) return t;
-  const all = await chrome.tabs.query({});
-  return all.find((x) => x.url && !x.url.startsWith("chrome://")) || all[0];
+  const workWinId = await getWorkWindowId();
+  if (workWinId) {
+    const actInWork = all.find(t => t.windowId === workWinId && t.active);
+    if (actInWork) return actInWork;
+    const anyInWork = all.find(t => t.windowId === workWinId && t.url && !t.url.startsWith("chrome://"));
+    if (anyInWork) return anyInWork;
+  }
+  const nonPersonal = all.find(t => t.url && !t.url.startsWith("chrome://")) || all[0];
+  return nonPersonal || null;
 }
 
 async function inPage(tab, func, args = [], world = "ISOLATED") {
@@ -69,9 +121,12 @@ async function withDebugger(tabId, fn) {
   const target = { tabId: Number(tabId) };
   try {
     await chrome.debugger.attach(target, "1.3");
+    rkLog({ kind: "system", level: "debug", tabId: target.tabId, msg: "dbg.attach ok" });
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
-    if (!msg.toLowerCase().includes("already attached")) {
+    rkLog({ kind: "system", level: "warn", tabId: target.tabId, msg: "dbg.attach err: " + msg });
+    const low = msg.toLowerCase();
+    if (!low.includes("already attached") || low.includes("another debugger")) {
       throw e;
     }
   }
@@ -116,28 +171,66 @@ async function cdpEval(tab, jsExpr) {
       };
     });
   } catch (e) {
+    const cdpMsg = String((e && e.message) || e || "");
     try {
-      const val = await inPage(
+      const wrapped = await inPage(
         tab,
         async (code) => {
           try {
             const r = (0, eval)(code);
-            return r && typeof r.then === 'function' ? await r : r;
+            const v = r && typeof r.then === "function" ? await r : r;
+            return { __rkEvalOk: true, value: v === undefined ? null : v };
           } catch (err) {
             try {
-              const fn = new Function('return (async () => { ' + code + ' })()');
-              return await fn();
+              const fn = new Function("return (async () => { " + code + " })()");
+              const v2 = await fn();
+              return { __rkEvalOk: true, value: v2 === undefined ? null : v2 };
             } catch (err2) {
-              return new Function(code)();
+              try {
+                const v3 = new Function(code)();
+                const v3a = v3 && typeof v3.then === "function" ? await v3 : v3;
+                return { __rkEvalOk: true, value: v3a === undefined ? null : v3a };
+              } catch (err3) {
+                const msg = String((err3 && err3.message) || err3 || "");
+                return {
+                  __rkEvalOk: false,
+                  csp: (err3 && err3.name === "EvalError") || /Content Security Policy/i.test(msg),
+                  error: msg || "eval failed",
+                };
+              }
             }
           }
         },
         [String(jsExpr)],
         "MAIN"
       );
-      return { ok: true, result: val };
+      if (wrapped && typeof wrapped === "object" && "__rkEvalOk" in wrapped) {
+        if (wrapped.__rkEvalOk) return { ok: true, result: wrapped.value };
+        return {
+          ok: false,
+          status: wrapped.csp ? "csp_blocked" : "eval_error",
+          error: wrapped.error || cdpMsg || "eval failed",
+          cdpError: cdpMsg || undefined,
+          result: null,
+        };
+      }
+      if (wrapped === null || wrapped === undefined) {
+        return {
+          ok: false,
+          status: cdpMsg ? "debugger_error" : "eval_error",
+          error: cdpMsg || "eval failed",
+          result: null,
+        };
+      }
+      return { ok: true, result: wrapped };
     } catch (e2) {
-      return { ok: false, error: String(e2 || e), result: null };
+      return {
+        ok: false,
+        status: "eval_error",
+        error: String(e2 || cdpMsg || "eval failed"),
+        cdpError: cdpMsg || undefined,
+        result: null,
+      };
     }
   }
 }
@@ -166,76 +259,29 @@ const H = {
     const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join("; ");
     return { ok: true, cookieString: cookieStr, cookies: cookies.map(c => ({ name: c.name, value: c.value })) };
   },
-  ping: async () => ({ ok: true, pong: true, version: RK_VERSION, ext: "ranukita-x-bridge", caps: RK_CAPS }),
-  health: async () => ({ ok: true, pong: true, version: RK_VERSION, ext: "ranukita-x-bridge", caps: RK_CAPS, xuser: await getXUser() }),
-  x_unfollow_step: async (m) => {
-    // Un unfollow atómico, verificado, en UNA pestaña de X dada (tabId obligatorio). El ritmo, el tope diario,
-    // la lista y el log los maneja el driver (rk-x-unfollow-candidates.py); acá no hay bucle.
-    if (m.tabId === undefined || m.tabId === null || m.tabId === "") return { ok: false, status: "bad_input", stop: true, detail: "tabId obligatorio" };
-    const tabId = Number(m.tabId);
-    let tab;
-    try { tab = await chrome.tabs.get(tabId); } catch (e) { return { ok: false, status: "bad_input", stop: true, detail: "tab inexistente" }; }
-    if (!isXUrl(tab.url)) return { ok: false, status: "bad_input", stop: true, detail: "la pestaña no es de X" };
-    const env = {
-      now: () => Date.now(),
-      sleep,
-      rand: (lo, hi) => lo + Math.random() * (hi - lo),
-      tabUrl: () => tab.url,
-      navigate: async (url) => {
-        const same = (tab.url || "").replace(/[?#].*$/, "").toLowerCase() === url.toLowerCase();
-        if (!isXUrl(url)) throw new Error("destino no es X");
-        if (same) await chrome.tabs.reload(tabId);
-        else await chrome.tabs.update(tabId, { url, active: false });
-      },
-      waitLoaded: async (ms) => {
-        const end = Date.now() + ms;
-        await sleep(500);
-        while (Date.now() < end) {
-          tab = await chrome.tabs.get(tabId);
-          if (tab.status === "complete") return;
-          await sleep(300);
-        }
-      },
-      snapshot: async (o) => {
-        const [r] = await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: xSnapshotInPage, args: [o] });
-        return r ? r.result : null;
-      },
-      click: async (x, y) => {
-        await withDebugger(tabId, async (target) => {
-          try { await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true }); } catch (e) {}
-          const ev = (type, extra) => chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", Object.assign({ type, x, y }, extra));
-          await ev("mouseMoved", { button: "none", buttons: 0 });
-          await sleep(60 + Math.random() * 120);
-          await ev("mousePressed", { button: "left", buttons: 1, clickCount: 1 });
-          await sleep(40 + Math.random() * 70);
-          await ev("mouseReleased", { button: "left", buttons: 0, clickCount: 1 });
-        });
-      },
-    };
-    // Tras navegar la URL puede cambiar: refrescar `tab` en cada snapshot vía waitLoaded; tabUrl() se lee antes de navegar.
-    try {
-      return await runUnfollowStep(env, m);
-    } catch (e) {
-      return { ok: false, status: "error", stop: true, detail: String(e && e.message ? e.message : e) };
-    }
-  },
+  ping: async () => ({ ok: true, pong: true, version: RK_VERSION, ext: "ranukita-bridge", caps: RK_CAPS }),
+  health: async () => ({ ok: true, pong: true, version: RK_VERSION, ext: "ranukita-bridge", caps: RK_CAPS, xuser: await getXUser() }),
   reload_ext: async () => {
     setTimeout(() => chrome.runtime.reload(), 100);
     return { ok: true, reloading: true };
   },
   xuser: async () => ({ ok: true, xuser: await getXUser() }),
-  list_tabs: async () => ({
-    ok: true,
-    tabs: (await chrome.tabs.query({})).map((t) => ({
-      id: t.id,
-      windowId: t.windowId,
-      url: t.url,
-      title: t.title,
-      active: t.active,
-      status: t.status, // v2.5.0 (campos nuevos, aditivos)
-      discarded: !!t.discarded,
-    })),
-  }),
+  list_tabs: async () => {
+    const personalWins = await getPersonalWindowIds();
+    const tabs = (await chrome.tabs.query({})).filter((t) => !personalWins.has(t.windowId) && !isPersonalTab(t));
+    return {
+      ok: true,
+      tabs: tabs.map((t) => ({
+        id: t.id,
+        url: t.url,
+        title: t.title,
+        active: t.active,
+        windowId: t.windowId,
+        status: t.status,
+        discarded: !!t.discarded,
+      })),
+    };
+  },
   navigate: async (m) => {
     if (isXUrl(m.url)) {
       const tabs = await chrome.tabs.query({});
@@ -259,7 +305,16 @@ const H = {
   },
   new_tab: async (m) => {
     if (m.xOnly && !isXUrl(m.url)) return { ok: false, error: "new_tab xOnly: la URL no es de X" };
-    const t = await chrome.tabs.create({ url: m.url, active: m.active === true });
+    const personalWins = await getPersonalWindowIds();
+    let targetWin = m.windowId ? Number(m.windowId) : null;
+    if (!targetWin || personalWins.has(targetWin)) {
+      targetWin = await getWorkWindowId();
+    }
+    const createOpts = { url: m.url, active: m.active === true };
+    if (targetWin) {
+      createOpts.windowId = targetWin;
+    }
+    const t = await chrome.tabs.create(createOpts);
     return { ok: true, tabId: t.id, windowId: t.windowId };
   },
   close_tab: async (m) => {
@@ -477,7 +532,8 @@ const H = {
       [m.selector]
     );
     // OJO: e.click() inyectado NO es de confianza; X lo ignora en unfollow/confirmar. Usar x_unfollow_step / cdp_click.
-    return { ok: !!r, untrusted: true, error: r ? undefined : "selector not found: " + m.selector };
+    const okVal = r && typeof r === "object" && "ok" in r ? !!r.ok : !!r;
+    return { ok: okVal, untrusted: true, error: okVal ? undefined : "selector not found in any frame" };
   },
   click_text: async (m) => {
     const t = await activeTab(m.tabId, m);
@@ -891,6 +947,7 @@ try {
   chrome.debugger.onDetach.addListener((src, reason) => {
     if (src && src.tabId !== undefined) {
       attachedTabs.delete(src.tabId);
+      rkLog({ kind: "system", level: "warn", tabId: src.tabId, msg: "dbg.onDetach (" + reason + ")" });
     }
     if (src && RK_CONSOLE_TABS.has(src.tabId)) {
       RK_CONSOLE_TABS.delete(src.tabId);
@@ -1000,10 +1057,9 @@ async function rkGuardTab(tab) {
   return dec;
 }
 
-const RK_TAB_ACTIONS = new Set(["navigate", "wait_idle", "wait_for", "screenshot", "see", "clear_overlay", "see2", "eval", "click", "click_text", "fill", "fill_form", "act", "type_human", "hover", "scroll", "select_option", "key", "inspect", "cdp_click", "cdp_focus", "cdp_type", "cdp_key", "upload", "set_files", "x_unfollow_step"]);
+const RK_TAB_ACTIONS = new Set(["navigate", "wait_idle", "wait_for", "screenshot", "see", "clear_overlay", "see2", "eval", "click", "click_text", "tclick_text", "read_text", "fill", "fill_form", "act", "type_human", "hover", "scroll", "select_option", "key", "inspect", "cdp_click", "cdp_focus", "cdp_type", "cdp_key", "upload", "set_files", "survey_click_start", "survey_click_in_oopif", "survey_apply_select", "survey_apply_select_oopif", "click_best_offer_survey", "x_unfollow_step"]);
 // Acciones que MUEVEN/ESCRIBEN en la página: ahí corre el guard. Las de solo lectura (see, inspect, screenshot…) no se bloquean: sirven para diagnosticar.
-// x_unfollow_step tiene su propio guard interno.
-const RK_ACTING = new Set(["click", "click_text", "fill", "fill_form", "act", "type_human", "select_option", "key", "cdp_click", "cdp_focus", "cdp_type", "cdp_key", "upload", "set_files"]);
+const RK_ACTING = new Set(["click", "click_text", "tclick_text", "fill", "fill_form", "act", "type_human", "select_option", "key", "cdp_click", "cdp_focus", "cdp_type", "cdp_key", "upload", "set_files", "survey_click_start", "survey_click_in_oopif", "survey_apply_select", "survey_apply_select_oopif", "click_best_offer_survey"]);
 
 async function rkPreflight(m) {
   if (!RK_TAB_ACTIONS.has(m.action)) return {};
@@ -1012,6 +1068,9 @@ async function rkPreflight(m) {
   if (explicit && !(m.action === "navigate" && isXUrl(m.url))) {
     try {
       tab = await chrome.tabs.get(Number(m.tabId));
+      if (isPersonalTab(tab)) {
+        return { block: { ok: false, status: "personal_profile_blocked", error: "PROTECCION ESTRICTA: La pestaña pertenece al perfil personal (tanquer9@gmail.com). Todos los crons deben ejecutarse en emilio@ranuk.dev.", tabId: Number(m.tabId) } };
+      }
     } catch (e) {
       // activeTab() caería en la pestaña activa de Emilio: lo evitamos.
       return { block: { ok: false, status: "no_tab", error: "tab inexistente: " + m.tabId, tabId: Number(m.tabId), hint: "No uso otra pestaña como reemplazo." } };
@@ -1083,7 +1142,8 @@ function rkNeedTabId(m) {
 
 Object.assign(H, {
   tabs_info: async (m) => {
-    let tabs = await chrome.tabs.query({});
+    const personalWins = await getPersonalWindowIds();
+    let tabs = (await chrome.tabs.query({})).filter((t) => !personalWins.has(t.windowId) && !isPersonalTab(t));
     if (m.discardedOnly) tabs = tabs.filter((t) => t.discarded);
     if (m.activeOnly) tabs = tabs.filter((t) => t.active);
     if (m.urlContains) tabs = tabs.filter((t) => String(t.url || "").toLowerCase().includes(String(m.urlContains).toLowerCase()));
@@ -1166,8 +1226,37 @@ Object.assign(H, {
     return { ok: true, count: entries.length, entries, stats: RK_LOG.stats() };
   },
   log_clear: async (m) => ({ ok: true, removed: RK_LOG.clear({ kind: m.kind, tabId: m.tabId }), stats: RK_LOG.stats() }),
-  debug_info: async () => ({ ok: true, version: RK_VERSION, caps: RK_CAPS, log: RK_LOG.stats(), consoleTabs: [...RK_CONSOLE_TABS.keys()], actingGuarded: [...RK_ACTING] }),
+  debug_info: async () => {
+    let attachedTargets = [];
+    try {
+      if (chrome.debugger && chrome.debugger.getTargets) {
+        attachedTargets = (await chrome.debugger.getTargets())
+          .filter((t) => t.attached)
+          .map((t) => ({ id: t.id, tabId: t.tabId, type: t.type, extensionId: t.extensionId || null, title: (t.title || "").slice(0, 60), url: (t.url || "").slice(0, 80) }));
+      }
+    } catch (e) {}
+    return { ok: true, version: RK_VERSION, caps: RK_CAPS, log: RK_LOG.stats(), consoleTabs: [...RK_CONSOLE_TABS.keys()], actingGuarded: [...RK_ACTING], attachedTargets };
+  },
 });
+
+async function handleCommand(m) {
+  const h = H[m.action];
+  if (!h) {
+    if (m && m.tabId !== undefined && m.tabId !== null && m.tabId !== "") {
+      try {
+        const pre = await rkPreflight(m);
+        if (pre && pre.block) {
+          rkLog({ kind: "action", level: "warn", tabId: Number(m.tabId), msg: m.action + " -> " + pre.block.status, data: { action: m.action, ok: false, status: pre.block.status } });
+          return pre.block;
+        }
+      } catch (e) {}
+    }
+    const res = { ok: false, error: "unknown action: " + m.action };
+    rkLog({ kind: "action", level: "warn", msg: m.action + " -> fail", data: { action: m.action, ok: false, error: res.error } });
+    return res;
+  }
+  return await dispatch(m, h);
+}
 
 function connect() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -1184,7 +1273,7 @@ function connect() {
       ws.send(
         JSON.stringify({
           type: "hello",
-          ext: "ranukita-x-bridge",
+          ext: "ranukita-bridge",
           version: RK_VERSION,
           caps: RK_CAPS,
           xuser: await getXUser(),
@@ -1199,13 +1288,7 @@ function connect() {
     } catch (e) {
       return;
     }
-    const h = H[m.action];
-    let res;
-    try {
-      res = h ? await dispatch(m, h) : { ok: false, error: "acción no soportada: " + m.action };
-    } catch (e) {
-      res = { ok: false, error: String(e && e.message ? e.message : e) };
-    }
+    const res = await handleCommand(m);
     try {
       ws.send(JSON.stringify({ id: m.id, ...res }));
     } catch (e) {}
