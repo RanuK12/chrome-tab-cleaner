@@ -8,6 +8,10 @@ const RK_CAPS = ["tabs_info", "site_access", "tab_reload_discarded", "guard_chec
 const WS_URL = "ws://127.0.0.1:9223/ws";
 let ws = null;
 const attachedTabs = new Map(); // tabId -> detachTimer
+const tabDbgLocks = new Map(); // tabId -> Promise chain (mutex FIFO por pestaña)
+const dbgInFlight = new Map(); // tabId -> operaciones CDP activas
+const dbgAttachedTabs = new Set(); // tabId -> adjuntado actualmente por esta extensión
+const dbgDetachState = new Map(); // tabId -> { reason, msg, ts }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -103,38 +107,109 @@ async function getXUser() {
   return null;
 }
 
-function scheduleDetach(tabId) {
-  if (attachedTabs.has(tabId)) {
-    clearTimeout(attachedTabs.get(tabId));
+function cancelDetach(tabId) {
+  const id = Number(tabId);
+  if (attachedTabs.has(id)) {
+    clearTimeout(attachedTabs.get(id));
+    attachedTabs.delete(id);
   }
+}
+
+function scheduleDetach(tabId) {
+  const id = Number(tabId);
+  cancelDetach(id);
+  if (typeof RK_CONSOLE_TABS !== "undefined" && RK_CONSOLE_TABS.has(id)) return;
+  if ((dbgInFlight.get(id) || 0) > 0) return;
   const timer = setTimeout(async () => {
-    attachedTabs.delete(tabId);
-    if (typeof RK_CONSOLE_TABS !== "undefined" && RK_CONSOLE_TABS.has(tabId)) return; // v2.5.0: captura de consola activa, no desconectar
+    attachedTabs.delete(id);
+    if (typeof RK_CONSOLE_TABS !== "undefined" && RK_CONSOLE_TABS.has(id)) return; // v2.5.0: captura de consola activa, no desconectar
+    if ((dbgInFlight.get(id) || 0) > 0 || tabDbgLocks.has(id)) return;
+    dbgAttachedTabs.delete(id);
     try {
-      await chrome.debugger.detach({ tabId });
+      await chrome.debugger.detach({ tabId: id });
     } catch (e) {}
   }, 4000);
-  attachedTabs.set(tabId, timer);
+  attachedTabs.set(id, timer);
+}
+
+function rkClassifyDbgReason(msg) {
+  const low = String(msg || "").toLowerCase();
+  if (low.includes("canceled_by_user") || low.includes("canceled")) return "canceled_by_user";
+  if (low.includes("another debugger")) return "another_debugger";
+  if (low.includes("not attached") || low.includes("detached")) return "not_attached";
+  return "attach_error";
+}
+
+async function rkEnsureAttached(target, alreadyHeld) {
+  const id = target.tabId;
+  let skipAttach = false;
+  if (alreadyHeld) {
+    skipAttach = true;
+    try {
+      if (chrome.debugger && chrome.debugger.getTargets) {
+        const targets = await chrome.debugger.getTargets();
+        const selfId = chrome.runtime && chrome.runtime.id;
+        const hit = targets.find((t) => t.tabId === id && t.attached && (!selfId || !t.extensionId || t.extensionId === selfId));
+        if (!hit) skipAttach = false;
+      }
+    } catch (e) {}
+  }
+  if (!skipAttach) {
+    try {
+      await chrome.debugger.attach(target, "1.3");
+      dbgAttachedTabs.add(id);
+      dbgDetachState.delete(id);
+      rkLog({ kind: "system", level: "debug", tabId: id, msg: "dbg.attach ok" });
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e);
+      const low = msg.toLowerCase();
+      rkLog({ kind: "system", level: "warn", tabId: id, msg: "dbg.attach err: " + msg });
+      if (!low.includes("already attached") || low.includes("another debugger")) {
+        dbgAttachedTabs.delete(id);
+        dbgDetachState.set(id, { reason: rkClassifyDbgReason(msg), msg: rkRedact(msg, 180), ts: Date.now() });
+        throw e;
+      }
+      dbgAttachedTabs.add(id);
+      dbgDetachState.delete(id);
+    }
+  }
 }
 
 async function withDebugger(tabId, fn) {
-  const target = { tabId: Number(tabId) };
+  const id = Number(tabId);
+  const target = { tabId: id };
+  const prev = tabDbgLocks.get(id) || Promise.resolve();
+  let releaseLock;
+  const next = new Promise((res) => { releaseLock = res; });
+  const chain = prev.catch(() => {}).then(() => next);
+  tabDbgLocks.set(id, chain);
+  await prev.catch(() => {});
+
+  dbgInFlight.set(id, (dbgInFlight.get(id) || 0) + 1);
+  const alreadyHeld = (typeof RK_CONSOLE_TABS !== "undefined" && RK_CONSOLE_TABS.has(id)) || attachedTabs.has(id) || dbgAttachedTabs.has(id);
+  cancelDetach(id);
   try {
-    await chrome.debugger.attach(target, "1.3");
-    rkLog({ kind: "system", level: "debug", tabId: target.tabId, msg: "dbg.attach ok" });
-  } catch (e) {
-    const msg = String(e && e.message ? e.message : e);
-    rkLog({ kind: "system", level: "warn", tabId: target.tabId, msg: "dbg.attach err: " + msg });
-    const low = msg.toLowerCase();
-    if (!low.includes("already attached") || low.includes("another debugger")) {
+    await rkEnsureAttached(target, alreadyHeld);
+    try {
+      return await fn(target);
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e);
+      const lastReason = dbgDetachState.get(id) && dbgDetachState.get(id).reason;
+      if (/not attached|detached/i.test(msg) && alreadyHeld && lastReason !== "canceled_by_user") {
+        dbgAttachedTabs.delete(id);
+        await rkEnsureAttached(target, false);
+        return await fn(target);
+      }
       throw e;
     }
-  }
-  scheduleDetach(target.tabId);
-  try {
-    return await fn(target);
   } finally {
-    scheduleDetach(target.tabId);
+    const left = Math.max(0, (dbgInFlight.get(id) || 1) - 1);
+    if (left === 0) dbgInFlight.delete(id);
+    else dbgInFlight.set(id, left);
+    const hasQueued = tabDbgLocks.get(id) !== chain;
+    if (!hasQueued) tabDbgLocks.delete(id);
+    releaseLock();
+    if (left === 0 && !hasQueued) scheduleDetach(id);
   }
 }
 
@@ -260,7 +335,15 @@ const H = {
     return { ok: true, cookieString: cookieStr, cookies: cookies.map(c => ({ name: c.name, value: c.value })) };
   },
   ping: async () => ({ ok: true, pong: true, version: RK_VERSION, ext: "ranukita-bridge", caps: RK_CAPS }),
-  health: async () => ({ ok: true, pong: true, version: RK_VERSION, ext: "ranukita-bridge", caps: RK_CAPS, xuser: await getXUser() }),
+  health: async () => ({
+    ok: true,
+    pong: true,
+    version: RK_VERSION,
+    ext: "ranukita-bridge",
+    caps: RK_CAPS,
+    xuser: await getXUser(),
+    debuggerCanceledTabs: [...dbgDetachState.entries()].filter(([, v]) => v && v.reason === "canceled_by_user").map(([k]) => k),
+  }),
   reload_ext: async () => {
     setTimeout(() => chrome.runtime.reload(), 100);
     return { ok: true, reloading: true };
@@ -848,33 +931,75 @@ const H = {
     if (!t) return { ok: false, error: "sin pestaña de X; no toco otras" };
     const sel = m.selector || 'input[type="file"]';
     const files = Array.isArray(m.files) ? m.files : [m.files].filter(Boolean);
-    return await withDebugger(t.id, async (target) => {
-      await chrome.debugger.sendCommand(target, "DOM.enable");
-      const doc = await chrome.debugger.sendCommand(target, "DOM.getDocument", { depth: 1 });
-      const q = await chrome.debugger.sendCommand(target, "DOM.querySelector", {
-        nodeId: doc.root.nodeId,
-        selector: sel,
-      });
-      if (q && q.nodeId) {
-        await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", {
-          nodeId: q.nodeId,
-          files,
-        });
-        return { ok: true, files };
+    const hasPayloads = Array.isArray(m.filePayloads) && m.filePayloads.length > 0;
+    const runDataTransferFallback = async (reason) => {
+      const res = await inPage(
+        t,
+        (selector, payloads) => {
+          const inp = document.querySelector(selector);
+          if (!inp) return { ok: false, error: "file input not found: " + selector };
+          const dt = new DataTransfer();
+          for (const p of payloads) {
+            const bin = atob(p.dataBase64 || "");
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const file = new File([bytes], p.name || "upload.bin", {
+              type: p.type || "application/octet-stream",
+              lastModified: Date.now(),
+            });
+            dt.items.add(file);
+          }
+          inp.files = dt.files;
+          inp.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+          inp.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+          return { ok: true, files: payloads.map((p) => p.name || "upload.bin"), fallback: "data_transfer" };
+        },
+        [sel, m.filePayloads],
+        "MAIN"
+      );
+      if (res && typeof res === "object") {
+        if (reason) res.fallbackReason = reason;
+        return res;
       }
-      // Fallback via Runtime.evaluate objectId
-      const ev = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
-        expression: `document.querySelector(${JSON.stringify(sel)})`,
-      });
-      if (ev && ev.result && ev.result.objectId) {
-        await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", {
-          objectId: ev.result.objectId,
-          files,
+      return { ok: false, error: "data_transfer_failed" };
+    };
+    try {
+      return await withDebugger(t.id, async (target) => {
+        await chrome.debugger.sendCommand(target, "DOM.enable");
+        const doc = await chrome.debugger.sendCommand(target, "DOM.getDocument", { depth: 1 });
+        const q = await chrome.debugger.sendCommand(target, "DOM.querySelector", {
+          nodeId: doc.root.nodeId,
+          selector: sel,
         });
-        return { ok: true, files };
+        if (q && q.nodeId) {
+          await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", {
+            nodeId: q.nodeId,
+            files,
+          });
+          return { ok: true, files };
+        }
+        // Fallback via Runtime.evaluate objectId
+        const ev = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+          expression: `document.querySelector(${JSON.stringify(sel)})`,
+        });
+        if (ev && ev.result && ev.result.objectId) {
+          await chrome.debugger.sendCommand(target, "DOM.setFileInputFiles", {
+            objectId: ev.result.objectId,
+            files,
+          });
+          return { ok: true, files };
+        }
+        return { ok: false, error: "file input not found: " + sel };
+      });
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e);
+      const cls = rkClassifyScriptError(msg);
+      const isDbgErr = (cls && cls.status === "debugger_error") || /debugger|canceled/i.test(msg);
+      if (hasPayloads && isDbgErr) {
+        return await runDataTransferFallback(rkClassifyDbgReason(msg));
       }
-      return { ok: false, error: "file input not found: " + sel };
-    });
+      throw e;
+    }
   },
   set_files: async (m) => {
     return await H.upload(m);
@@ -946,7 +1071,9 @@ try {
   });
   chrome.debugger.onDetach.addListener((src, reason) => {
     if (src && src.tabId !== undefined) {
-      attachedTabs.delete(src.tabId);
+      cancelDetach(src.tabId);
+      dbgAttachedTabs.delete(src.tabId);
+      dbgDetachState.set(src.tabId, { reason: String(reason || "detached"), ts: Date.now() });
       rkLog({ kind: "system", level: "warn", tabId: src.tabId, msg: "dbg.onDetach (" + reason + ")" });
     }
     if (src && RK_CONSOLE_TABS.has(src.tabId)) {
@@ -955,6 +1082,9 @@ try {
     }
   });
   chrome.tabs.onRemoved.addListener((tabId) => {
+    cancelDetach(tabId);
+    dbgAttachedTabs.delete(tabId);
+    dbgDetachState.delete(tabId);
     if (RK_CONSOLE_TABS.delete(tabId)) rkLog({ kind: "system", level: "info", tabId, msg: "pestaña cerrada; captura de consola detenida" });
   });
 } catch (e) {}
@@ -1026,6 +1156,7 @@ async function rkErrorResponse(e, m) {
   const c = rkClassifyScriptError(e);
   if (!c) return { ok: false, error: msg };
   const res = { ok: false, status: c.status, error: msg, hint: c.hint, hint_en: c.hint_en };
+  if (c.status === "debugger_error") res.dbgReason = rkClassifyDbgReason(msg);
   if (m && m.tabId !== undefined && m.tabId !== null && m.tabId !== "") res.tabId = Number(m.tabId);
   if (c.status === "no_site_access" || c.status === "restricted_page") {
     try {
@@ -1235,7 +1366,18 @@ Object.assign(H, {
           .map((t) => ({ id: t.id, tabId: t.tabId, type: t.type, extensionId: t.extensionId || null, title: (t.title || "").slice(0, 60), url: (t.url || "").slice(0, 80) }));
       }
     } catch (e) {}
-    return { ok: true, version: RK_VERSION, caps: RK_CAPS, log: RK_LOG.stats(), consoleTabs: [...RK_CONSOLE_TABS.keys()], actingGuarded: [...RK_ACTING], attachedTargets };
+    return {
+      ok: true,
+      version: RK_VERSION,
+      caps: RK_CAPS,
+      log: RK_LOG.stats(),
+      consoleTabs: [...RK_CONSOLE_TABS.keys()],
+      actingGuarded: [...RK_ACTING],
+      attachedTargets,
+      attachedTracked: [...dbgAttachedTabs],
+      inFlightTabs: Object.fromEntries(dbgInFlight),
+      detachedTabs: Object.fromEntries(dbgDetachState),
+    };
   },
 });
 

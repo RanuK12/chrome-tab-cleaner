@@ -115,8 +115,8 @@ function rkClassifyScriptError(err) {
     return { status: "frame_gone", hint: "La página navegó o se cerró durante la acción; reintentá tras wait_idle.", hint_en: "The page navigated or closed mid-action; retry after wait_idle." };
   }
   if (/Tabs cannot be edited right now/i.test(msg)) return { status: "tab_busy", hint: "Chrome está arrastrando una pestaña; reintentá.", hint_en: "Chrome is busy dragging a tab; retry." };
-  if (/Another debugger is already attached|Debugger is not attached|Cannot attach to this target|Cannot access a chrome/i.test(msg)) {
-    return { status: "debugger_error", hint: "Otro depurador (DevTools) está conectado a esa pestaña, o no se puede adjuntar.", hint_en: "Another debugger (DevTools) holds this tab, or attach is not possible." };
+  if (/Another debugger is already attached|Debugger is not attached|Cannot attach to this target|Cannot access a chrome|canceled_by_user|debugger.*detach/i.test(msg)) {
+    return { status: "debugger_error", hint: "Otro depurador (DevTools) está conectado, se canceló la barra de depuración, o no se puede adjuntar.", hint_en: "Another debugger (DevTools) holds this tab, the debug banner was canceled, or attach is not possible." };
   }
   return null;
 }
